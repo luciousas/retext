@@ -27,7 +27,7 @@ from PyQt6.QtCore import QDir, QFile, QFileInfo, QPoint, Qt, QTimer, QUrl, pyqtS
 from PyQt6.QtGui import QTextCursor, QTextDocument
 from PyQt6.QtWidgets import QMessageBox, QSplitter, QTextEdit
 
-from ReText import app_version, converterprocess, globalSettings
+from ReText import app_version, converterprocess, debugLog, globalSettings
 from ReText.editor import ReTextEdit
 from ReText.highlighter import ReTextHighlighter
 from ReText.preview import ReTextPreview
@@ -44,6 +44,7 @@ class ReTextTab(QSplitter):
     fileNameChanged = pyqtSignal()
     modificationStateChanged = pyqtSignal()
     activeMarkupChanged = pyqtSignal()
+    navigationPositionChanged = pyqtSignal()
 
     # Make _fileName a read-only property to make sure that any
     # modification happens through the proper functions. These functions
@@ -63,7 +64,7 @@ class ReTextTab(QSplitter):
         self.p = parent
         self._fileName = fileName
         self.editBox = ReTextEdit(self)
-        self.previewBox = self.createPreviewBox(self.editBox)
+        self.previewBox = self.createPreviewBox()
         self.activeMarkupClass = None
         self.markup = None
         self.converted = None
@@ -72,9 +73,17 @@ class ReTextTab(QSplitter):
         self.conversionPending = False
         self.cssFileExists = False
         self.forceDisableAutoSave = False
+        self._pendingPreviewSourceLine = None
+        self._showPreviewAfterRestore = False
+        # This is the canonical navigation state for a tab: a zero-based
+        # Markdown source line, normally the active heading in the outline.
+        self.navigationAnchorLine = 0
 
         self.converterProcess = converterprocess.ConverterProcess()
         self.converterProcess.conversionDone.connect(self.updatePreviewBox)
+        self.previewUpdateTimer = QTimer(self)
+        self.previewUpdateTimer.setSingleShot(True)
+        self.previewUpdateTimer.timeout.connect(self.startPendingConversion)
 
         textDocument = self.editBox.document()
         self.highlighter = ReTextHighlighter(textDocument)
@@ -100,31 +109,14 @@ class ReTextTab(QSplitter):
         textDocument.modificationChanged.connect(self.handleModificationChanged)
 
         self.updateActiveMarkupClass()
+        self.connectPreviewSignals()
 
     def handleModificationChanged(self):
         self.modificationStateChanged.emit()
 
-    def createPreviewBox(self, editBox):
-
-        # Use closures to avoid a hard reference from ReTextWebEnginePreview
-        # to self, which would keep the tab and its resources alive
-        # even after other references to it have disappeared.
-
-        def editorPositionToSourceLine(editorPosition):
-            viewportPosition = editorPosition - editBox.verticalScrollBar().value()
-            sourceLine = editBox.cursorForPosition(QPoint(0,viewportPosition)).blockNumber()
-            return sourceLine
-
-        def sourceLineToEditorPosition(sourceLine):
-            doc = editBox.document()
-            block = doc.findBlockByNumber(sourceLine)
-            rect = doc.documentLayout().blockBoundingRect(block)
-            return rect.top()
-
+    def createPreviewBox(self):
         if ReTextWebEnginePreview and globalSettings.useWebEngine:
-            preview = ReTextWebEnginePreview(self,
-                                             editorPositionToSourceLine,
-                                             sourceLineToEditorPosition)
+            preview = ReTextWebEnginePreview(self)
         else:
             preview = ReTextPreview(self)
 
@@ -265,6 +257,11 @@ class ReTextTab(QSplitter):
             self.previewBox.updateScrollPosition(scrollbar.minimum(),
                                                  scrollbar.maximum())
         else:
+            restoreSourceLine = self._pendingPreviewSourceLine
+            if restoreSourceLine is None and self.previewState == PreviewNormal:
+                # A file reload replaces the WebEngine document.  Restore the
+                # same outline anchor, never an independently guessed pixel.
+                restoreSourceLine = self.navigationAnchorLine
             # Always provide a baseUrl otherwise QWebView will
             # refuse to show images or other external objects
             if self._fileName:
@@ -272,23 +269,34 @@ class ReTextTab(QSplitter):
             else:
                 baseUrl = QUrl.fromLocalFile(QDir.currentPath())
             self.previewBox.setHtml(html, baseUrl)
+            if restoreSourceLine is not None:
+                self.previewBox.restoreSourceLine(restoreSourceLine)
+            self._pendingPreviewSourceLine = None
 
         if self.previewOutdated:
             self.triggerPreviewUpdate()
 
-    def triggerPreviewUpdate(self):
+    def triggerPreviewUpdate(self, immediate=False):
+        """Queue a preview conversion, debouncing edits but not mode switches."""
         self.previewOutdated = True
         if self.previewState == PreviewDisabled:
             return
 
         if not self.conversionPending:
             self.conversionPending = True
-            QTimer.singleShot(500, self.startPendingConversion)
+            self.previewUpdateTimer.start(0 if immediate else 500)
+        elif immediate and self.previewUpdateTimer.isActive():
+            # A user explicitly requested the reading view; do not make it
+            # wait behind the typing debounce that was scheduled before click.
+            self.previewUpdateTimer.start(0)
 
     def startPendingConversion(self):
         self.previewOutdated = False
 
-        requested_extensions = ['ReText.mdx_posmap'] if globalSettings.syncScroll else []
+        requested_extensions = (
+            ['ReText.mdx_posmap']
+            if isinstance(self.previewBox, ReTextWebEnginePreview) else []
+        )
         self.converterProcess.start_conversion(self.getActiveMarkupClass().name,
                                                self.fileName,
                                                requested_extensions,
@@ -299,11 +307,94 @@ class ReTextTab(QSplitter):
         self.editBox.setVisible(self.previewState < PreviewNormal)
         self.previewBox.setVisible(self.previewState > PreviewDisabled)
 
+    def connectPreviewSignals(self):
+        """Connect signals belonging to the currently owned preview widget."""
+        if not isinstance(self.previewBox, ReTextWebEnginePreview):
+            return
+        self.previewBox.positionRestored.connect(self.showReadingPreview)
+        self.previewBox.positionRestored.connect(self.navigationPositionChanged)
+        self.previewBox.page().scrollPositionChanged.connect(
+            lambda _position: self.navigationPositionChanged.emit())
+
+    def showReadingPreview(self):
+        """Reveal a newly rendered preview only after its anchor is restored."""
+        if self.previewState != PreviewNormal or not self._showPreviewAfterRestore:
+            return
+        self._showPreviewAfterRestore = False
+        self.updateBoxesVisibility()
+        debugLog('preview-revealed', anchor=self.navigationAnchorLine)
+
+    def sourceLineAtEditorTop(self):
+        # QTextEdit reports the line immediately above a block when its top
+        # coordinate lies on the one-pixel block boundary.  The navigation
+        # anchor is the first visible source line, hence the correction.
+        line = self.editBox.cursorForPosition(QPoint(0, 0)).blockNumber()
+        return min(line + 1, self.editBox.document().blockCount() - 1)
+
+    def restoreEditorToSourceLine(self, sourceLine):
+        block = self.editBox.document().findBlockByNumber(sourceLine)
+        if block.isValid():
+            # QTextEdit restores its viewport around the text cursor when it
+            # receives focus.  Moving only the scrollbar left the cursor at
+            # line 1, so the focus event immediately undid the requested
+            # scroll and overwrote the chapter anchor with the document top.
+            self.editBox.setTextCursor(QTextCursor(block))
+            position = self.editBox.document().documentLayout().blockBoundingRect(block).top()
+            self.editBox.verticalScrollBar().setValue(int(position))
+            debugLog('source-restore', anchor=sourceLine,
+                     cursor=self.editBox.textCursor().blockNumber(), scroll=int(position))
+
+    def setNavigationAnchor(self, sourceLine):
+        self.navigationAnchorLine = max(0, int(sourceLine))
+        debugLog('anchor-set', anchor=self.navigationAnchorLine,
+                 previewState=self.previewState)
+
+    def navigateToSourceLine(self, sourceLine):
+        """Navigate the visible surface to one canonical source anchor."""
+        self.setNavigationAnchor(sourceLine)
+        if self.previewState == PreviewNormal and isinstance(self.previewBox, ReTextWebEnginePreview):
+            self.previewBox.restoreSourceLine(self.navigationAnchorLine)
+        else:
+            self.goToLine(self.navigationAnchorLine)
+            self.editBox.ensureCursorVisible()
+            self.editBox.setFocus(Qt.FocusReason.OtherFocusReason)
+
+    def setReadingMode(self, enabled):
+        """Switch once between source and reading without continuous sync."""
+        if isinstance(self.previewBox, ReTextWebEnginePreview):
+            # Invalidate before changing visibility.  A queued scroll signal
+            # from the old preview must never overwrite the anchor captured by
+            # the window for this mode transition.
+            self.previewBox.invalidateNavigationState()
+        if enabled:
+            self._pendingPreviewSourceLine = self.navigationAnchorLine
+            self.previewState = PreviewNormal
+            if isinstance(self.previewBox, ReTextWebEnginePreview):
+                # Leave the source surface in place during conversion.  Showing
+                # the old hidden WebEngine document first causes a visible jump
+                # to its stale top position before the new anchor is restored.
+                self._showPreviewAfterRestore = True
+                self.editBox.setVisible(True)
+                self.previewBox.setVisible(False)
+            else:
+                self.updateBoxesVisibility()
+        else:
+            self._pendingPreviewSourceLine = None
+            self.previewState = PreviewDisabled
+            self._showPreviewAfterRestore = False
+            self.updateBoxesVisibility()
+        debugLog('mode-set', reading=enabled, anchor=self.navigationAnchorLine)
+        if not enabled:
+            self.restoreEditorToSourceLine(self.navigationAnchorLine)
+            self.editBox.ensureCursorVisible()
+            self.editBox.setFocus(Qt.FocusReason.OtherFocusReason)
+
     def rebuildPreviewBox(self):
         self.previewBox.disconnectExternalSignals()
         self.previewBox.setParent(None)
         self.previewBox.deleteLater()
-        self.previewBox = self.createPreviewBox(self.editBox)
+        self.previewBox = self.createPreviewBox()
+        self.connectPreviewSignals()
         self.previewBox.setMinimumWidth(125)
         self.addWidget(self.previewBox)
         self.setSizes((50, 50))

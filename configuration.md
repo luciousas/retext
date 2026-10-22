@@ -14,7 +14,6 @@ option name                    | type      | description
 `defaultMarkup`                | string    | name of markup to use for unknown files
 `defaultPreviewState`          | string    | mode for new tabs: `editor`, `normal-preview` or `live-preview` (default: `editor`)
 `detectEncoding`               | boolean   | whether to automatically detect files encoding; needs chardet package (default: true)
-`directoryPath`                | string    | the path to the root directory to display in the side panel if `showDirectoryTree` is true (default: `~`)
 `documentStatsEnabled`         | boolean   | whether to show document stats (word count, character count) (default: false)
 `editorFont`                   | string    | font to use for editor (comma-separated string as returned by [QFont.toString()])
 `font`                         | string    | font to use for previews (comma-separated string as returned by [QFont.toString()])
@@ -37,11 +36,9 @@ option name                    | type      | description
 `savePreviewState`             | boolean   | whether to restore the preview state each of the last documents was closed in, falling back to `defaultPreviewState`; requires `openLastFilesOnStartup` (default: false)
 `saveWindowGeometry`           | boolean   | whether to restore window geometry from previous session (default: false)
 `scrollFactor`                 | float     | scrolling speed factor (default: 1.0)
-`showDirectoryTree`            | boolean   | whether to show a directory tree on the left side of the window (default: false)
 `spellCheck`                   | boolean   | whether to enable spell checking
 `spellCheckLocale`             | string    | spell check locale to use, possibly comma-separated (examples: `pt_BR`, `ru,en_US`)
 `styleSheet`                   | file path | CSS file to use in preview area
-`syncScroll`                   | boolean   | whether to enable synchronized scrolling for Markdown (default: true)
 `tabBarAutoHide`               | boolean   | whether to hide the tabs bar when only one tab is open (default: false)
 `tabInsertsSpaces`             | boolean   | whether Tab key should insert spaces instead of tabs (default: true)
 `tabWidth`                     | integer   | the width of tab character (default: 4)

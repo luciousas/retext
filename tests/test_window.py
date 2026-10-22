@@ -159,6 +159,120 @@ class TestWindow(unittest.TestCase):
         self.assertEqual('New document[*]', self.window.windowTitle())
         self.assertFalse(self.window.currentTab.fileName)
 
+    def test_document_outline_navigates_to_source_line(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n## Second\nmore\n### Third\n')
+        app.processEvents()
+        self.window.refreshOutline()
+
+        first = self.window.outlineTree.topLevelItem(0)
+        second = first.child(0)
+        third = second.child(0)
+        self.assertEqual(first.text(0), 'First')
+        self.assertEqual(second.text(0), 'Second')
+        self.assertEqual(third.text(0), 'Third')
+
+        self.window.outlineItemActivated(third)
+
+        self.assertFalse(self.window.outlineTree.isHidden())
+        self.assertEqual(self.window.currentTab.editBox.textCursor().blockNumber(), 4)
+
+    def test_document_outline_click_uses_the_tab_navigation_anchor(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n## Second\n')
+        app.processEvents()
+        self.window.refreshOutline()
+        target = self.window.outlineTree.topLevelItem(0).child(0)
+        self.window.currentTab.navigateToSourceLine = MagicMock()
+        self.window.currentTab.setNavigationAnchor = MagicMock()
+
+        self.window.outlineItemActivated(target)
+
+        self.window.currentTab.navigateToSourceLine.assert_called_once_with(2)
+        self.window.currentTab.setNavigationAnchor.assert_called_once_with(2)
+
+    def test_capture_navigation_anchor_keeps_last_heading_when_preview_is_loading(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n## Second\n')
+        app.processEvents()
+        self.window.refreshOutline()
+        tab = self.window.currentTab
+        tab.setNavigationAnchor(2)
+        tab.previewState = PreviewNormal
+        tab.previewBox = MagicMock()
+        tab.previewBox.sourceLineAtCurrentScroll.return_value = None
+
+        with patch('ReText.window.ReTextWebEnginePreview', type(tab.previewBox)):
+            self.assertEqual(self.window.captureNavigationAnchor(tab), 2)
+            self.assertEqual(tab.navigationAnchorLine, 2)
+
+    def test_source_mode_restore_moves_editor_cursor_to_navigation_anchor(self):
+        self.window = ReTextWindow()
+        self.window.createNew('\n'.join(f'line {number}' for number in range(160)))
+        app.processEvents()
+        tab = self.window.currentTab
+        tab.setNavigationAnchor(120)
+
+        tab.setReadingMode(False)
+        app.processEvents()
+
+        self.assertEqual(tab.editBox.textCursor().blockNumber(), 120)
+
+    def test_mode_switch_invalidates_old_webengine_navigation_events(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n')
+        tab = self.window.currentTab
+        preview = MagicMock()
+        tab.previewBox = preview
+
+        with patch('ReText.tab.ReTextWebEnginePreview', type(preview)):
+            tab.setReadingMode(True)
+
+        preview.invalidateNavigationState.assert_called_once_with()
+
+    def test_reading_preview_is_revealed_only_after_anchor_restore(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n')
+        tab = self.window.currentTab
+        preview = MagicMock()
+        tab.previewBox = preview
+
+        with patch('ReText.tab.ReTextWebEnginePreview', type(preview)):
+            tab.setReadingMode(True)
+            self.assertTrue(tab._showPreviewAfterRestore)
+            preview.setVisible.assert_called_with(False)
+            tab.showReadingPreview()
+
+        self.assertFalse(tab._showPreviewAfterRestore)
+        preview.setVisible.assert_called_with(True)
+
+    def test_manual_preview_request_bypasses_typing_debounce(self):
+        self.window = ReTextWindow()
+        self.window.createNew('# First\ntext\n')
+        tab = self.window.currentTab
+        tab.previewState = PreviewNormal
+        tab.conversionPending = False
+        tab.previewUpdateTimer = MagicMock()
+
+        tab.triggerPreviewUpdate(immediate=True)
+
+        tab.previewUpdateTimer.start.assert_called_once_with(0)
+
+    def test_minimal_menu_and_toolbar(self):
+        self.window = ReTextWindow()
+
+        self.assertEqual(
+            self.window.menuBar().actions(),
+            [
+                self.window.actionNew,
+                self.window.actionPreview,
+                self.window.actionFullScreen,
+            ],
+        )
+        self.assertEqual(self.window.toolBar.actions(), [])
+        self.assertTrue(self.window.toolBar.isHidden())
+        self.assertTrue(self.window.editBar.isHidden())
+
     @patch(
         'ReText.window.QFileDialog.getOpenFileNames',
         return_value=([os.path.join(path_to_testdata, 'existing_file.md')], None),

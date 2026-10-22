@@ -16,7 +16,8 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from os.path import abspath, dirname, expanduser, join
+from os import environ
+from os.path import abspath, dirname, join
 
 import markups
 import markups.common
@@ -24,6 +25,7 @@ from PyQt6.QtCore import QByteArray, QLocale, QSettings
 from PyQt6.QtGui import QFont, QFontDatabase
 
 app_version = "8.1.0"
+DEBUG_LOG_ENABLED = environ.get('RETEXT_DEBUG') == '1'
 
 settings = QSettings('ReText project', 'ReText')
 
@@ -46,6 +48,14 @@ def getBundledIcon(iconName):
     return join(packageDir, 'icons', iconName + '.png')
 
 
+def debugLog(event, **fields):
+    """Emit compact navigation diagnostics only when explicitly enabled."""
+    if not DEBUG_LOG_ENABLED:
+        return
+    details = ' '.join(f'{key}={value!r}' for key, value in fields.items())
+    print(f'RETEXT_DEBUG {event} {details}', flush=True)
+
+
 configOptions = {
     'appStyleSheet': '',
     'autoSave': False,
@@ -53,7 +63,6 @@ configOptions = {
     'defaultMarkup': markups.MarkdownMarkup.name,
     'defaultPreviewState': 'editor',
     'detectEncoding': True,
-    'directoryPath': expanduser("~"),
     'documentStatsEnabled': False,
     'editorFont': '',
     'font': '',
@@ -76,11 +85,9 @@ configOptions = {
     'savePreviewState': False,
     'saveWindowGeometry': False,
     'scrollFactor': 1.0,
-    'showDirectoryTree': False,
     'spellCheck': False,
     'spellCheckLocale': '',
     'styleSheet': '',
-    'syncScroll': True,
     'tabBarAutoHide': False,
     'tabInsertsSpaces': True,
     'tabWidth': 4,

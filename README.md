@@ -7,6 +7,12 @@ ReText is a simple but powerful editor for markup languages. It is based on
 [Markups] module which supports Markdown, reStructuredText, Textile and
 AsciiDoc. One can also add support for [custom markups] using Python modules.
 
+## Local fork
+
+This repository is a personal fork tailored for lightweight local Markdown
+reading and editing on GNOME Wayland. Its added behavior, operational defaults,
+and validation procedure are documented in [LOCAL_FEATURES.md].
+
 ![ReText on Plasma 5 desktop][Screenshot]
 
 To install ReText, make sure that you have [Python] (3.9 or later) installed,

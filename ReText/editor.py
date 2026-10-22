@@ -51,7 +51,6 @@ from PyQt6.QtGui import (
     QTextDocument,
     QTextFormat,
     QTextOption,
-    QWheelEvent,
 )
 from PyQt6.QtWidgets import QApplication, QFileDialog, QLabel, QTextEdit, QWidget
 
@@ -158,7 +157,6 @@ def documentIndentLess(document, cursor, globalSettings=globalSettings):
 
 class ReTextEdit(QTextEdit):
     resized = pyqtSignal(QRect)
-    scrollLimitReached = pyqtSignal(QWheelEvent)
     returnBlockPattern = re.compile("^[\\s]*([*>-]|\\d+\\.)? ")
     orderedListPattern = re.compile("^([\\s]*)(\\d+)\\. $")
     wordPattern = re.compile(r"\w+")
@@ -244,14 +242,6 @@ class ReTextEdit(QTextEdit):
             self.parent.setEditorFont(font)
         else:
             super().wheelEvent(event)
-
-            if event.angleDelta().y() < 0:
-                scrollBarLimit = self.verticalScrollBar().maximum()
-            else:
-                scrollBarLimit = self.verticalScrollBar().minimum()
-
-            if self.verticalScrollBar().value() == scrollBarLimit:
-                self.scrollLimitReached.emit(event)
 
     def scrollContentsBy(self, dx, dy):
         super().scrollContentsBy(dx, dy)

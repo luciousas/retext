@@ -22,14 +22,15 @@ import shlex
 import sys
 import traceback
 import warnings
+from bisect import bisect_right
 from subprocess import Popen
 
 import markups
 
-from ReText import app_version, getBundledIcon, globalCache, globalSettings
+from ReText import app_version, debugLog, getBundledIcon, globalCache, globalSettings
 from ReText.config import ConfigDialog, setIconThemeFromSettings
 from ReText.dialogs import EncodingDialog, HtmlDialog, LocaleDialog
-from ReText.filesystemmodel import ReTextFileSystemModel
+from ReText.outline import get_markdown_headings
 from ReText.tab import (
     PreviewDisabled,
     PreviewLive,
@@ -93,7 +94,8 @@ from PyQt6.QtWidgets import (
     QTabWidget,
     QToolBar,
     QToolButton,
-    QTreeView,
+    QTreeWidget,
+    QTreeWidgetItem,
 )
 
 previewStatesByName = {
@@ -137,10 +139,20 @@ class ReTextWindow(QMainWindow):
             self.setWindowIcon(QIcon.fromTheme('retext',
                 QIcon.fromTheme('accessories-text-editor')))
         self.splitter = QSplitter(self)
-        self.treeView = QTreeView(self.splitter)
-        self.treeView.doubleClicked.connect(self.treeItemSelected)
-        self.initDirectoryTree()
-        self.treeView.setVisible(globalSettings.showDirectoryTree)
+        self.outlineTree = QTreeWidget(self.splitter)
+        self.outlineTree.setHeaderLabel(self.tr('章节目录'))
+        self.outlineTree.setUniformRowHeights(True)
+        self.outlineTree.itemClicked.connect(self.outlineItemActivated)
+        self.outlineItems = []
+        self.outlineLines = []
+        self.outlineRefreshTimer = QTimer(self)
+        self.outlineRefreshTimer.setInterval(150)
+        self.outlineRefreshTimer.setSingleShot(True)
+        self.outlineRefreshTimer.timeout.connect(self.refreshOutline)
+        self.outlineLocationTimer = QTimer(self)
+        self.outlineLocationTimer.setInterval(80)
+        self.outlineLocationTimer.setSingleShot(True)
+        self.outlineLocationTimer.timeout.connect(self.refreshOutlineLocation)
         self.tabWidget = QTabWidget(self.splitter)
         self.initTabWidget()
         if globalCache.splitterState:
@@ -223,8 +235,6 @@ class ReTextWindow(QMainWindow):
             self.actionPreview.setIcon(QIcon(getBundledIcon('document-preview')))
         self.actionLivePreview = self.act(self.tr('Live preview'), shct=Qt.Modifier.CTRL | Qt.Key.Key_L,
         trigbool=self.enableLivePreview)
-        menuPreview = QMenu()
-        menuPreview.addAction(self.actionLivePreview)
         self.actionInsertTable = self.act(self.tr('Insert table'),
             trig=lambda: self.insertFormatting('table'))
         self.actionTableMode = self.act(self.tr('Table editing mode'),
@@ -293,10 +303,6 @@ class ReTextWindow(QMainWindow):
             self.actionWebEngine.setEnabled(False)
         self.actionWebEngine.setChecked(globalSettings.useWebEngine)
         self.actionShow = self.act(self.tr('Show directory'), 'document-open-folder', self.showInDir)
-        self.actionShowDirectoryTree = self.act(self.tr('Show directory tree'),
-            trigbool=self.treeView.setVisible,
-            shct=Qt.Key.Key_F9)
-        self.actionShowDirectoryTree.setChecked(globalSettings.showDirectoryTree)
         self.actionFind = self.act(self.tr('Next'), 'go-next', self.find,
             shct=QKeySequence.StandardKey.FindNext)
         self.actionFindPrev = self.act(self.tr('Previous'), 'go-previous',
@@ -352,110 +358,18 @@ class ReTextWindow(QMainWindow):
         self.symbolBox.activated.connect(self.insertSymbol)
         self.updateStyleSheet()
         menubar = self.menuBar()
-        menuFile = menubar.addMenu(self.tr('&File'))
-        menuEdit = menubar.addMenu(self.tr('&Edit'))
-        menuHelp = menubar.addMenu(self.tr('&Help'))
-        menuFile.addAction(self.actionNew)
-        menuFile.addAction(self.actionOpen)
-        self.menuRecentFiles = menuFile.addMenu(
-            self.actIcon('document-open-recent'),
-            self.tr('Open recent'),
-        )
-        self.menuRecentFiles.aboutToShow.connect(self.updateRecentFiles)
-        menuFile.addAction(self.actionShow)
-        menuFile.addAction(self.actionShowDirectoryTree)
-        menuFile.addAction(self.actionSetEncoding)
-        menuFile.addAction(self.actionReload)
-        menuFile.addAction(self.actionCopyFilePath)
-        menuFile.addSeparator()
-        menuFile.addAction(self.actionSave)
-        menuFile.addAction(self.actionSaveAs)
-        menuFile.addSeparator()
-        menuFile.addAction(self.actionNextTab)
-        menuFile.addAction(self.actionPrevTab)
-        menuFile.addAction(self.actionCloseCurrentTab)
-        menuFile.addSeparator()
-        menuExport = menuFile.addMenu(self.tr('Export'))
-        menuExport.addAction(self.actionSaveHtml)
-        menuExport.addAction(self.actionOdf)
-        menuExport.addAction(self.actionPdf)
-        if self.extensionActions:
-            menuExport.addSeparator()
-            for action, mimetype in self.extensionActions:
-                menuExport.addAction(action)
-            menuExport.aboutToShow.connect(self.updateExtensionsVisibility)
-        menuFile.addAction(self.actionPrint)
-        menuFile.addAction(self.actionPrintPreview)
-        menuFile.addSeparator()
-        menuFile.addAction(self.actionQuit)
-        menuEdit.addAction(self.actionUndo)
-        menuEdit.addAction(self.actionRedo)
-        menuEdit.addSeparator()
-        menuEdit.addAction(self.actionCut)
-        menuEdit.addAction(self.actionCopy)
-        menuEdit.addAction(self.actionPaste)
-        menuEdit.addAction(self.actionPasteImage)
-        menuEdit.addSeparator()
-        menuEdit.addAction(self.actionMoveUp)
-        menuEdit.addAction(self.actionMoveDown)
-        menuEdit.addSeparator()
-        if enchant is not None:
-            menuSC = menuEdit.addMenu(self.tr('Spell check'))
-            menuSC.addAction(self.actionEnableSC)
-            menuSC.addAction(self.actionSetLocale)
-        menuEdit.addAction(self.actionSearch)
-        menuEdit.addAction(self.actionGoToLine)
-        menuEdit.addAction(self.actionChangeEditorFont)
-        menuEdit.addAction(self.actionChangePreviewFont)
-        menuEdit.addSeparator()
-        if len(availableMarkups) > 1:
-            self.menuMode = menuEdit.addMenu(self.tr('Default markup'))
-            for markupAction in markupActions:
-                self.menuMode.addAction(markupAction)
-        menuFormat = menuEdit.addMenu(self.tr('Formatting'))
-        menuFormat.addAction(self.actionBold)
-        menuFormat.addAction(self.actionItalic)
-        menuFormat.addAction(self.actionUnderline)
-        menuEdit.addAction(self.actionWebEngine)
-        menuEdit.addSeparator()
-        menuEdit.addAction(self.actionViewHtml)
-        menuEdit.addAction(self.actionPreview)
-        menuEdit.addAction(self.actionLivePreview)
-        menuEdit.addAction(self.actionInsertTable)
-        menuEdit.addAction(self.actionTableMode)
-        menuEdit.addAction(self.actionInsertImages)
-        if ReTextFakeVimHandler:
-            menuEdit.addAction(self.actionFakeVimMode)
-        menuEdit.addSeparator()
-        menuEdit.addAction(self.actionFullScreen)
-        menuEdit.addAction(self.actionConfig)
-        menuHelp.addAction(self.actionHelp)
-        menuHelp.addAction(self.actionWhatsNew)
-        menuHelp.addSeparator()
-        menuHelp.addAction(self.actionAbout)
-        menuHelp.addAction(self.actionAboutQt)
-        self.toolBar.addAction(self.actionNew)
-        self.toolBar.addSeparator()
-        self.toolBar.addAction(self.actionOpen)
-        self.toolBar.addAction(self.actionSave)
-        self.toolBar.addAction(self.actionPrint)
-        self.toolBar.addSeparator()
-        previewButton = QToolButton(self.toolBar)
-        previewButton.setDefaultAction(self.actionPreview)
-        previewButton.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
-        previewButton.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        previewButton.setMenu(menuPreview)
-        self.toolBar.addWidget(previewButton)
-        self.toolBar.addAction(self.actionFullScreen)
-        self.editBar.addAction(self.actionUndo)
-        self.editBar.addAction(self.actionRedo)
-        self.editBar.addSeparator()
-        self.editBar.addAction(self.actionCut)
-        self.editBar.addAction(self.actionCopy)
-        self.editBar.addAction(self.actionPaste)
-        self.editBar.addSeparator()
-        self.editBar.addWidget(self.formattingBox)
-        self.editBar.addWidget(self.symbolBox)
+        menubar.clear()
+        self.actionPreview.setText(self.tr('阅读 / 源代码'))
+        menubar.addAction(self.actionNew)
+        menubar.addAction(self.actionPreview)
+        menubar.addAction(self.actionFullScreen)
+        # The menu bar is the single top-level control row.  Repeating the
+        # same three actions in a toolbar wastes vertical space and confused
+        # the compact reader layout.
+        self.toolBar.clear()
+        self.toolBar.setVisible(False)
+        self.editBar.clear()
+        self.editBar.setVisible(False)
         self.searchEdit = QLineEdit(self.searchBar)
         self.searchEdit.setPlaceholderText(self.tr('Search'))
         self.searchEdit.returnPressed.connect(self.find)
@@ -539,28 +453,88 @@ class ReTextWindow(QMainWindow):
         self.tabWidget.dropEvent = dropEvent
         self.tabWidget.setTabBarAutoHide(globalSettings.tabBarAutoHide)
 
-    def initDirectoryTree(self):
-        path = globalSettings.directoryPath
-        self.fileSystemModel = ReTextFileSystemModel(self.treeView)
-        self.fileSystemModel.setRootPath(path)
-        supportedExtensions = ['.txt']
-        for markup in markups.get_all_markups():
-            supportedExtensions += markup.file_extensions
-        filters = ["*" + s for s in supportedExtensions]
-        self.fileSystemModel.setNameFilters(filters)
-        self.fileSystemModel.setNameFilterDisables(False)
-        self.treeView.setModel(self.fileSystemModel)
-        self.treeView.setRootIndex(self.fileSystemModel.index(path))
-        self.treeView.setColumnHidden(1, True)
-        self.treeView.setColumnHidden(2, True)
-        self.treeView.setColumnHidden(3, True)
-        self.treeView.setHeaderHidden(True)
+    def refreshOutline(self):
+        """Rebuild the current document's heading tree from Markdown source."""
+        tab = self.currentTab
+        self.outlineTree.setUpdatesEnabled(False)
+        try:
+            self.outlineTree.clear()
+            self.outlineItems = []
+            self.outlineLines = []
+            if tab is None or tab.getActiveMarkupClass() != markups.MarkdownMarkup:
+                return
+            parents = []
+            for level, title, line_number in get_markdown_headings(tab.editBox.toPlainText()):
+                while parents and parents[-1][0] >= level:
+                    parents.pop()
+                parent = parents[-1][1] if parents else self.outlineTree.invisibleRootItem()
+                item = QTreeWidgetItem(parent, [title])
+                item.setData(0, Qt.ItemDataRole.UserRole, line_number)
+                item.setToolTip(0, self.tr('第 {0} 行').format(line_number + 1))
+                item.setExpanded(True)
+                parents.append((level, item))
+                self.outlineLines.append(line_number)
+                self.outlineItems.append((line_number, item))
+            self.selectOutlineAnchor(tab, tab.navigationAnchorLine)
+        finally:
+            self.outlineTree.setUpdatesEnabled(True)
 
-    def treeItemSelected(self, signal):
-        file_path = self.fileSystemModel.filePath(signal)
-        if os.path.isdir(file_path):
+    def scheduleOutlineRefresh(self, tab):
+        if tab == self.currentTab:
+            self.outlineRefreshTimer.start()
+
+    def scheduleOutlineLocationRefresh(self, tab):
+        if tab == self.currentTab:
+            self.outlineLocationTimer.start()
+
+    def selectOutlineAnchor(self, tab, sourceLine):
+        if tab != self.currentTab or not self.outlineItems:
             return
-        self.openFileWrapper(file_path)
+        index = max(0, bisect_right(self.outlineLines, sourceLine) - 1)
+        selected = self.outlineItems[index]
+        if (tab.navigationAnchorLine == selected[0]
+                and self.outlineTree.currentItem() is selected[1]):
+            return
+        tab.setNavigationAnchor(selected[0])
+        self.outlineTree.setCurrentItem(selected[1])
+        debugLog('outline-select', sourceLine=sourceLine, selected=selected[0])
+
+    def refreshOutlineLocation(self):
+        tab = self.currentTab
+        if tab is None:
+            return
+        if tab.previewState == PreviewNormal and isinstance(tab.previewBox, ReTextWebEnginePreview):
+            sourceLine = tab.previewBox.sourceLineAtCurrentScroll()
+        else:
+            sourceLine = tab.sourceLineAtEditorTop()
+        if sourceLine is not None:
+            debugLog('outline-location', sourceLine=sourceLine,
+                     mode=tab.previewState)
+            self.selectOutlineAnchor(tab, sourceLine)
+        else:
+            debugLog('outline-location-skipped', mode=tab.previewState,
+                     anchor=tab.navigationAnchorLine)
+
+    def captureNavigationAnchor(self, tab):
+        """Capture a stable heading before a source/reading mode transition.
+
+        A WebEngine document reports a temporary scroll position of zero while
+        loading.  ``refreshOutlineLocation`` intentionally rejects that state;
+        this method therefore preserves the last confirmed heading instead of
+        replacing it with the first heading during a mode switch.
+        """
+        if tab == self.currentTab:
+            self.refreshOutlineLocation()
+        debugLog('anchor-captured', anchor=tab.navigationAnchorLine,
+                 mode=tab.previewState)
+        return tab.navigationAnchorLine
+
+    def outlineItemActivated(self, item, _column=0):
+        line_number = item.data(0, Qt.ItemDataRole.UserRole)
+        if not isinstance(line_number, int) or self.currentTab is None:
+            return
+        self.currentTab.navigateToSourceLine(line_number)
+        self.selectOutlineAnchor(self.currentTab, line_number)
 
     def act(self, name, icon=None, trig=None, trigbool=None, shct=None):
         if not isinstance(shct, QKeySequence):
@@ -654,6 +628,12 @@ class ReTextWindow(QMainWindow):
             lambda: self.tabModificationStateChanged(self.currentTab)
         )
         self.currentTab.activeMarkupChanged.connect(lambda: self.tabActiveMarkupChanged(self.currentTab))
+        tab = self.currentTab
+        tab.editBox.textChanged.connect(lambda: self.scheduleOutlineRefresh(tab))
+        tab.editBox.verticalScrollBar().valueChanged.connect(
+            lambda: self.scheduleOutlineLocationRefresh(tab))
+        tab.navigationPositionChanged.connect(
+            lambda: self.scheduleOutlineLocationRefresh(tab))
         self.tabWidget.addTab(self.currentTab, self.tr("New document"))
         self.currentTab.updateBoxesVisibility()
         if previewState > 0:
@@ -699,6 +679,7 @@ class ReTextWindow(QMainWindow):
         self.tabFileNameChanged(self.currentTab)
         self.tabModificationStateChanged(self.currentTab)
         self.tabActiveMarkupChanged(self.currentTab)
+        self.refreshOutline()
 
     def changeEditorFont(self):
         font, ok = QFontDialog.getFont(globalSettings.getEditorFont(), self)
@@ -734,11 +715,15 @@ class ReTextWindow(QMainWindow):
             self.preview(previewState == PreviewNormal)
 
     def preview(self, viewmode):
-        self.currentTab.previewState = viewmode * 2
+        # Capture the current outline heading before hiding either surface.
+        # This makes the heading, not a transient pixel offset, the hand-off
+        # state for both source → reading and reading → source.
+        self.currentTab.setNavigationAnchor(
+            self.captureNavigationAnchor(self.currentTab))
+        self.currentTab.setReadingMode(viewmode)
         self.actionLivePreview.setChecked(False)
         self.editBar.setDisabled(viewmode)
-        self.currentTab.updateBoxesVisibility()
-        self.currentTab.triggerPreviewUpdate()
+        self.currentTab.triggerPreviewUpdate(immediate=viewmode)
 
     def enableLivePreview(self, livemode):
         self.currentTab.previewState = int(livemode)
@@ -879,20 +864,6 @@ class ReTextWindow(QMainWindow):
 
     def switchTab(self, shift=1):
         self.tabWidget.setCurrentIndex((self.ind + shift) % self.tabWidget.count())
-
-    def updateRecentFiles(self):
-        self.menuRecentFiles.clear()
-        self.recentFilesActions = []
-        filesOld = globalCache.recentFileList
-        files = []
-        for f in filesOld:
-            if QFile.exists(f):
-                files.append(f)
-                action = self.act(f.replace('&', '&&'), trig=self.openFunction(f))
-                self.recentFilesActions.append(action)
-        globalCache.recentFileList = files
-        for action in self.recentFilesActions:
-            self.menuRecentFiles.addAction(action)
 
     def markupFunction(self, markup):
         return lambda: self.setDefaultMarkup(markup)
@@ -1381,10 +1352,7 @@ class ReTextWindow(QMainWindow):
                 return closeevent.ignore()
         if globalSettings.saveWindowGeometry:
             globalCache.windowGeometry = self.saveGeometry()
-            if self.treeView.isVisible():
-                globalCache.splitterState = self.splitter.saveState()
-            else:
-                globalCache.splitterState = QByteArray()
+            globalCache.splitterState = self.splitter.saveState()
         else:
             globalCache.windowGeometry = QByteArray()
             globalCache.splitterState = QByteArray()

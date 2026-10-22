@@ -73,14 +73,6 @@ class FileSelectButton(FileDialogButton):
         )[0]
         self.updateLabelText()
 
-class DirectorySelectButton(FileDialogButton):
-    def processClick(self):
-        startDir = (QFileInfo(self.fileName).absolutePath()
-                    if self.fileName else '')
-        self.fileName = QFileDialog.getExistingDirectory(
-            self, self.tr('Select directory to open'), startDir)
-        self.updateLabelText()
-
 class ClickableLabel(QLabel):
     clicked = pyqtSignal()
 
@@ -137,7 +129,6 @@ class ConfigDialog(QDialog):
                 (self.tr('Default preview state'), 'defaultPreviewState'),
                 (self.tr('Open external links in ReText window'), 'handleWebLinks'),
                 (self.tr('Markdown syntax extensions (comma-separated)'), 'markdownExtensions'),
-                (self.tr('Enable synchronized scrolling for Markdown'), 'syncScroll'),
             #    (self.tr('Default Markdown file extension'), 'markdownDefaultFileExtension'),
             #    (self.tr('Default reStructuredText file extension'), 'restDefaultFileExtension'),
             )),
@@ -158,8 +149,6 @@ class ConfigDialog(QDialog):
                 (self.tr('Stylesheet file'), 'styleSheet', True),
                 (self.tr('Hide tabs bar when there is only one tab'), 'tabBarAutoHide'),
                 (self.tr('Show full path in window title'), 'windowTitleFullPath'),
-                (self.tr('Show directory tree'), 'showDirectoryTree'),
-                (self.tr('Working directory'), 'directoryPath', True),
             ))
         )
 
@@ -221,8 +210,6 @@ class ConfigDialog(QDialog):
                 self.configurators[name].addItem(self.tr('Repeat'), 'repeat')
                 comboBoxIndex = self.configurators[name].findData(value)
                 self.configurators[name].setCurrentIndex(comboBoxIndex)
-            elif name == 'directoryPath':
-                self.configurators[name] = DirectorySelectButton(self, value, fileLabel)
             elif isinstance(value, bool):
                 self.configurators[name] = QCheckBox(self)
                 self.configurators[name].setChecked(value)
@@ -290,13 +277,8 @@ class ConfigDialog(QDialog):
             tab.editBox.viewport().update()
         self.parent.updateStyleSheet()
         self.parent.tabWidget.setTabBarAutoHide(globalSettings.tabBarAutoHide)
-        self.parent.toolBar.setVisible(not globalSettings.hideToolBar)
-        self.parent.editBar.setVisible(not globalSettings.hideToolBar)
-        path = globalSettings.directoryPath
-        self.parent.fileSystemModel.setRootPath(path)
-        self.parent.treeView.setRootIndex(self.parent.fileSystemModel.index(path))
-        self.parent.actionShowDirectoryTree.setChecked(globalSettings.showDirectoryTree)
-        self.parent.treeView.setVisible(globalSettings.showDirectoryTree)
+        self.parent.toolBar.setVisible(False)
+        self.parent.editBar.setVisible(False)
         if globalSettings.autoSave:
             self.parent.autoSaveTimer.start(60000)
         else:

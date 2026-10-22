@@ -126,10 +126,7 @@ def main():
         window.restoreLastOpenedFiles()
     for fileName in fileNames:
         if isdir(fileName):
-            window.fileSystemModel.setRootPath(fileName)
-            window.treeView.setRootIndex(window.fileSystemModel.index(fileName))
-            window.actionShowDirectoryTree.setChecked(True)
-            window.treeView.setVisible(True)
+            continue
         elif fileName == '-':
             readStdIn = True
         else:

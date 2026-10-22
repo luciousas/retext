@@ -16,7 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-from PyQt6.QtCore import QEvent, Qt
+from bisect import bisect_left, bisect_right
+from numbers import Real
+
+from PyQt6.QtCore import QEvent, QPoint, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import (
     QColor,
     QCursor,
@@ -35,9 +38,8 @@ from PyQt6.QtWebEngineCore import (
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QApplication, QLabel
 
-from ReText import globalCache, globalSettings
+from ReText import debugLog, globalCache, globalSettings
 from ReText.editor import getColor
-from ReText.syncscroll import SyncScroll
 
 
 class ReTextWebEngineUrlRequestInterceptor(QWebEngineUrlRequestInterceptor):
@@ -87,30 +89,64 @@ class ReTextWebEnginePage(QWebEnginePage):
     def __init__(self, parent, tab):
         QWebEnginePage.__init__(self, parent)
         self.tab = tab
+        # JavaScript callbacks outlive the DOM that issued them.  Keep an
+        # explicit document generation and request sequence so a callback from
+        # a replaced page can never update synchronized scrolling state.
+        self._positionMapEpoch = 0
+        self._positionMapRequest = 0
         self.interceptor = ReTextWebEngineUrlRequestInterceptor(self)
         self.setUrlRequestInterceptor(self.interceptor)
         self.urlPopup = UrlPopup(self.tab.p)
         self.linkHovered.connect(self.urlPopup.pop)
+        self.loadStarted.connect(self.invalidatePositionMaps)
+
+    def invalidatePositionMaps(self):
+        self._positionMapEpoch += 1
 
     def setScrollPosition(self, pos):
         self.runJavaScript(f"window.scrollTo({pos.x()}, {pos.y()});")
 
     def getPositionMap(self, callback):
+        epoch = self._positionMapEpoch
+        self._positionMapRequest += 1
+        request = self._positionMapRequest
+
         def resultCallback(result):
-            if result:
-                return callback({int(a): b for a, b in result.items()})
+            if epoch != self._positionMapEpoch or request != self._positionMapRequest:
+                return
+            if not isinstance(result, dict):
+                return
+            positionMap = {}
+            for line, position in result.items():
+                try:
+                    line = int(line)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(position, Real) and not isinstance(position, bool):
+                    positionMap[line] = float(position)
+            # An empty map is meaningful to the caller while a document is
+            # still settling: it may make one bounded retry.  Do not silently
+            # turn that state into a permanent "top of document" position.
+            callback(positionMap)
 
         script = """
+        if (!document.body) {
+            ({});
+        } else {
         var elements = document.querySelectorAll('[data-posmap]');
         var result = {};
         var bodyTop = document.body.getBoundingClientRect().top;
         for (var i = 0; i < elements.length; ++i) {
             var element = elements[i];
-            value = element.getAttribute('data-posmap');
-            bottom = element.getBoundingClientRect().bottom - bodyTop;
-            result[value] = bottom;
+            var value = element.getAttribute('data-posmap');
+            // A chapter anchor denotes the beginning of a rendered block.
+            // Using its bottom delays outline changes and returns to the
+            // preceding paragraph when a heading is selected.
+            var elementTop = element.getBoundingClientRect().top - bodyTop;
+            result[value] = elementTop;
         }
         result;
+        }
         """
         self.runJavaScript(script, resultCallback)
 
@@ -137,9 +173,12 @@ class ReTextWebEnginePage(QWebEnginePage):
 
 class ReTextWebEnginePreview(QWebEngineView):
 
-    def __init__(self, tab,
-                 editorPositionToSourceLineFunc,
-                 sourceLineToEditorPositionFunc):
+    # Emitted only after the current document has a position map and its
+    # requested anchor has been applied.  Consumers must not use the transient
+    # zero scroll position emitted during a WebEngine load as navigation state.
+    positionRestored = pyqtSignal()
+
+    def __init__(self, tab):
 
         QWebEngineView.__init__(self, parent=tab)
         webPage = ReTextWebEnginePage(self, tab)
@@ -149,14 +188,18 @@ class ReTextWebEnginePreview(QWebEngineView):
         webPage.linkHovered.connect(lambda value: self.setCursor(handCursor if value else arrowCursor))
 
         self.setPage(webPage)
-
-        self.editBox = tab.editBox
-        self.syncscroll = SyncScroll(
-            webPage,
-            editorPositionToSourceLineFunc,
-            sourceLineToEditorPositionFunc,
-            setEditorScrollValueFunc=self.editBox.verticalScrollBar().setValue,
-        )
+        # The preview and editor deliberately do not subscribe to one another's
+        # scroll events.  In a Wayland WebEngine view those asynchronous events
+        # can arrive after a reload and form a feedback loop.  We only map a
+        # position once while switching between source and reading modes.
+        self.positionMap = {}
+        self._renderEpoch = 0
+        self._pendingSourceLine = None
+        self._positionReady = False
+        self._positionMapAttempts = 0
+        self._restoredAnchor = None
+        self._navigationEpoch = 0
+        self.loadFinished.connect(self._documentLoaded)
 
         settings = self.settings()
         settings.setDefaultTextEncoding('utf-8')
@@ -170,18 +213,6 @@ class ReTextWebEnginePreview(QWebEngineView):
             if windowColor.lightness() <= 150:
                 settings.setAttribute(QWebEngineSettings.WebAttribute.ForceDarkMode, True)
 
-        # Events relevant to sync scrolling
-        self.editBox.cursorPositionChanged.connect(self._handleCursorPositionChanged)
-        self.editBox.verticalScrollBar().valueChanged.connect(self.syncscroll.handleEditorScrolled)
-        self.editBox.resized.connect(self._handleEditorResized)
-
-        # When preview is scrolled, update the editor scroll accordingly
-        webPage.scrollPositionChanged.connect(self.syncscroll.handlePreviewScrolled)
-
-        # Scroll the preview when the mouse wheel is used to scroll
-        # beyond the beginning/end of the editor
-        self.editBox.scrollLimitReached.connect(self._handleWheelEvent)
-
     def setFont(self, font):
         settings = self.settings()
         settings.setFontFamily(QWebEngineSettings.FontFamily.StandardFont,
@@ -193,14 +224,147 @@ class ReTextWebEnginePreview(QWebEngineView):
     def setHtml(self, html, baseUrl):
         # A hack to prevent WebEngine from stealing the focus
         self.setEnabled(False)
+        self._renderEpoch += 1
+        self.positionMap = {}
+        self._positionReady = False
+        self._positionMapAttempts = 0
+        self._restoredAnchor = None
+        self._navigationEpoch += 1
+        self.page().invalidatePositionMaps()
+        debugLog('preview-render', epoch=self._renderEpoch)
         super().setHtml(html, baseUrl)
         self.setEnabled(True)
 
-    def _handleWheelEvent(self, event):
-        # Only pass wheelEvents on to the preview if syncscroll is
-        # controlling the position of the preview
-        if self.syncscroll.isActive():
-            QGuiApplication.sendEvent(self.focusProxy(), event)
+    def invalidateNavigationState(self):
+        """Make every position event from the previous visible preview stale.
+
+        Conversion is intentionally delayed.  Without this boundary, the old
+        hidden page can emit a final scroll event during that delay and replace
+        the anchor captured for the source-to-reading transition.
+        """
+        self._positionReady = False
+        self.positionMap = {}
+        self._pendingSourceLine = None
+        self._restoredAnchor = None
+        self._navigationEpoch += 1
+        self.page().invalidatePositionMaps()
+        debugLog('preview-navigation-invalidated', epoch=self._renderEpoch)
+
+    @staticmethod
+    def sourceLineForPreviewPosition(positionMap, previewY):
+        """Return the zero-based source line for a preview position."""
+        if not positionMap:
+            return None
+        ordered = sorted((position, line) for line, position in positionMap.items())
+        positions = [position for position, _line in ordered]
+        # mdx_posmap stores the empty line *after* a rendered Markdown block.
+        # Convert it once here so every caller uses zero-based source lines.
+        return max(0, ordered[max(0, bisect_right(positions, previewY) - 1)][1] - 1)
+
+    @staticmethod
+    def previewPositionForSourceLine(positionMap, sourceLine):
+        """Return the rendered block position corresponding to a source line."""
+        if not positionMap:
+            return None
+        lines = sorted(positionMap)
+        # The map is keyed by the line after each block.  For a heading at
+        # source line N, the first map entry at or after N + 1 is its block,
+        # while the old predecessor lookup incorrectly selected the previous
+        # paragraph.
+        index = bisect_left(lines, sourceLine + 1)
+        line = lines[min(index, len(lines) - 1)]
+        return positionMap[line]
+
+    def sourceLineAtCurrentScroll(self):
+        if not self._positionReady:
+            return None
+        scrollY = self.page().scrollPosition().y()
+        if self._restoredAnchor is not None:
+            sourceLine, restoredY = self._restoredAnchor
+            # QWebEngine takes integral scroll positions while DOM geometry is
+            # fractional.  At a restored heading it can report one pixel
+            # before the marker, which belongs to the previous paragraph in a
+            # position map.  Treat the requested anchor as authoritative until
+            # the user actually scrolls away from that position.
+            if abs(scrollY - restoredY) <= 3:
+                return sourceLine
+            self._restoredAnchor = None
+        return self.sourceLineForPreviewPosition(self.positionMap, scrollY)
+
+    def restoreSourceLine(self, sourceLine):
+        """Restore one source anchor after the current document has loaded."""
+        self._pendingSourceLine = (self._renderEpoch, int(sourceLine))
+        debugLog('preview-restore-request', epoch=self._renderEpoch,
+                 anchor=sourceLine, mapSize=len(self.positionMap))
+        if self.positionMap:
+            self._applyPendingRestore()
+
+    def _documentLoaded(self, ok):
+        if not ok:
+            return
+        epoch = self._renderEpoch
+        debugLog('preview-loaded', epoch=epoch, ok=ok)
+        # Let the initial layout settle once.  This is a one-shot read, not a
+        # continuous resize/scroll observer.
+        QTimer.singleShot(100, lambda: self._refreshPositionMap(epoch))
+
+    def _refreshPositionMap(self, epoch):
+        if epoch != self._renderEpoch:
+            return
+        self._positionMapAttempts += 1
+        self.page().getPositionMap(
+            lambda positionMap: self._storePositionMap(epoch, positionMap))
+
+    def _storePositionMap(self, epoch, positionMap):
+        if epoch != self._renderEpoch:
+            return
+        if not positionMap:
+            debugLog('preview-map-empty', epoch=epoch,
+                     attempts=self._positionMapAttempts)
+            # This is a single layout retry.  It is deliberately not a timer
+            # loop or scroll listener: after a real document load, either the
+            # Markdown markers exist or the old stable anchor is retained.
+            if self._positionMapAttempts < 2:
+                QTimer.singleShot(250, lambda: self._refreshPositionMap(epoch))
+            return
+        self.positionMap = positionMap
+        debugLog('preview-map-ready', epoch=epoch, size=len(positionMap),
+                 pending=self._pendingSourceLine)
+        self._applyPendingRestore()
+
+    def _applyPendingRestore(self):
+        if self._pendingSourceLine is None:
+            return
+        epoch, sourceLine = self._pendingSourceLine
+        if epoch != self._renderEpoch or not self.positionMap:
+            return
+        self._pendingSourceLine = None
+        position = self.previewPositionForSourceLine(self.positionMap, sourceLine)
+        if isinstance(position, Real) and not isinstance(position, bool):
+            # Ignore WebEngine's load-time y=0 notification until the stable
+            # document map and the requested anchor are both in place.
+            debugLog('preview-restore-applied', epoch=epoch, anchor=sourceLine,
+                     position=int(position))
+            navigationEpoch = self._navigationEpoch
+
+            def scrollApplied(actualPosition):
+                if (epoch != self._renderEpoch or
+                        navigationEpoch != self._navigationEpoch):
+                    return
+                restoredY = (int(actualPosition)
+                             if isinstance(actualPosition, Real)
+                             and not isinstance(actualPosition, bool)
+                             else int(position))
+                self._positionReady = True
+                self._restoredAnchor = (sourceLine, restoredY)
+                debugLog('preview-restore-visible', epoch=epoch,
+                         anchor=sourceLine, position=restoredY)
+                self.positionRestored.emit()
+
+            self.page().runJavaScript(
+                f"window.scrollTo(0, {int(position)}); window.scrollY;",
+                scrollApplied,
+            )
 
     def event(self, event):
         # Work-around https://bugreports.qt.io/browse/QTBUG-43602
@@ -227,21 +391,7 @@ class ReTextWebEnginePreview(QWebEngineView):
         return True
 
     def disconnectExternalSignals(self):
-        self.editBox.cursorPositionChanged.disconnect(self._handleCursorPositionChanged)
-        self.editBox.verticalScrollBar().valueChanged.disconnect(self.syncscroll.handleEditorScrolled)
-        self.editBox.resized.disconnect(self._handleEditorResized)
-
-        self.editBox.scrollLimitReached.disconnect(self._handleWheelEvent)
-        # Disconnect preview scroll synchronization
-        self.page().scrollPositionChanged.disconnect(self.syncscroll.handlePreviewScrolled)
-
-    def _handleCursorPositionChanged(self):
-        editorCursorPosition = self.editBox.verticalScrollBar().value() + \
-                       self.editBox.cursorRect().top()
-        self.syncscroll.handleCursorPositionChanged(editorCursorPosition)
-
-    def _handleEditorResized(self, rect):
-        self.syncscroll.handleEditorResized(rect.height())
+        self._pendingSourceLine = None
 
     def wheelEvent(self, event):
         if QGuiApplication.keyboardModifiers() == Qt.KeyboardModifier.ControlModifier:
