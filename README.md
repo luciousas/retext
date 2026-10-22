@@ -7,6 +7,8 @@
 本仓库不是 PicoMD 的源码，也不是知识库、同步服务或 PDF 阅读器。目标是稳定地打开本地
 Markdown，阅读、编辑并在章节间导航。
 
+![PicoMD Reader 当前界面：左侧章节目录与右侧 Markdown 阅读预览](docs/images/picomd-reader-overview.png)
+
 ## 本 fork 的功能
 
 - 多标签 Markdown 文档；关闭最后一个标签即退出，不保存会话。
