@@ -1,3 +1,19 @@
+## 本地 fork 维护记录（2026-10-22）
+
+此节记录 `luciousas/retext` 的本地维护改动，不替代后续上游 ReText 的发行说明。
+
+* 面向 GNOME Wayland 的本地 Markdown 阅读工作流：多标签、章节目录、精简菜单、桌面
+  Markdown 默认关联与单实例文件转发。
+* 目录由当前 Markdown 标题构建，取代文件系统目录树；删除
+  `ReText/filesystemmodel.py`。
+* 删除编辑器/预览双向像素滚动同步模块 `ReText/syncscroll.py`，改用源代码行号锚点和
+  带代号校验的 WebEngine 异步位置恢复。
+* 支持相对 Markdown 链接在程序内打开、相对 PDF 链接交给系统默认阅读器，以及外部文件
+  修改后按标签刷新。
+* 新增本地维护说明 `LOCAL_FEATURES.md`，并将 README 改为本 fork 的使用入口。
+
+以下内容为上游 ReText 的历史发行记录：
+
 ## ReText 8.1.0 (2025-01-09)
 
 * Dependency changes:

@@ -1,8 +1,13 @@
-ReText stores all of its configuration in a text file. A path to that
-file is printed to stdout during ReText startup.
+# 配置说明
 
-Possible configuration options
-==============================
+本地 PicoMD Reader fork 继承 ReText 的配置文件格式。启动时会在标准输出中打印配置文件
+路径；通过本仓库的桌面启动项运行时，配置和缓存被隔离在仓库的 `.runtime/` 下，避免影响
+系统安装的 ReText。
+
+本 fork 的常用工作流是：不自动恢复上次会话、使用 `阅读 / 源代码` 手动切换、由左侧章节
+目录导航。菜单已经精简；下表保留的是程序仍支持的配置项，部分高级功能在精简菜单中没有入口。
+
+## 配置项
 
 Configuration options that you can set to improve your experience:
 
